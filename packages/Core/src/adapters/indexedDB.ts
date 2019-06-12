@@ -2,6 +2,7 @@ import { InanoSQLAdapter, InanoSQLDataModel, InanoSQLTable, InanoSQLPlugin, Inan
 import { hash, generateID, cast, deepGet, deepSet, allAsync, setFast } from "../utilities";
 import { nanoSQLMemoryIndex } from "./memoryIndex";
 import { deepEqual } from "assert";
+let localForage = require('localforage');
 
 export class IndexedDB extends nanoSQLMemoryIndex {
 
@@ -36,41 +37,50 @@ export class IndexedDB extends nanoSQLMemoryIndex {
     createTable(tableName: string, tableData: InanoSQLTable, complete: () => void, error: (err: any) => void) {
 
         let version = 1;
+        let modelHash, idb;
         this._tableConfigs[tableName] = tableData;
         const dataModelHash = hash(JSON.stringify(tableData.columns));
+        let promise
         if (this.version) { // manually handled by developer
             version = this.version;
+            promise = Promise.resolve(true)
         } else { // automatically handled by nanoSQL
-            version = parseInt(localStorage.getItem(this._id + "_" + tableName + "_idb_version") || "1");
-            const modelHash = localStorage.getItem(this._id + "_" + tableName + "_idb_hash") || dataModelHash;
-
-            if (modelHash !== dataModelHash) {
-                version++;
-            }
-
-            localStorage.setItem(this._id + "_" + tableName + "_idb_version", String(version));
-            localStorage.setItem(this._id + "_" + tableName + "_idb_hash", dataModelHash);
+            promise = localForage.getItem(this._id + "_" + tableName + "_idb_version").then(item => {
+              version = parseInt(item || "1");
+              return localForage.getItem(this._id + "_" + tableName + "_idb_hash")
+            }).then(item => {
+              modelHash = item || dataModelHash;
+              if (modelHash !== dataModelHash) {
+                  version++;
+              }
+              return localForage.setItem(this._id + "_" + tableName + "_idb_version", String(version))
+            }).then(item => {
+              return localForage.setItem(this._id + "_" + tableName + "_idb_hash", dataModelHash)
+            })
         }
+        promise.then(() => {
+          idb = indexedDB.open(this._id + "_" + tableName, version);
+          return localForage.getItem(this._id + "_" + tableName + "_idb_ai")
+        }).then(val => {
+          this._ai[tableName] = parseInt(val || "0");
 
-        const idb = indexedDB.open(this._id + "_" + tableName, version);
-        this._ai[tableName] = parseInt(localStorage.getItem(this._id + "_" + tableName + "_idb_ai") || "0");
+          idb.onerror = error;
+          let isUpgrading = false;
+          // Called only when there is no existing DB, creates the tables and data store.
+          idb.onupgradeneeded = (event: any) => {
+              this._db[tableName] = event.target.result;
 
-        idb.onerror = error;
-        let isUpgrading = false;
-        // Called only when there is no existing DB, creates the tables and data store.
-        idb.onupgradeneeded = (event: any) => {
-            this._db[tableName] = event.target.result;
+              if (!this._db[tableName].objectStoreNames.contains(tableName)) {
+                  this._db[tableName].createObjectStore(tableName, { keyPath: tableData.pkCol.join(".") });
+              }
+          };
 
-            if (!this._db[tableName].objectStoreNames.contains(tableName)) {
-                this._db[tableName].createObjectStore(tableName, { keyPath: tableData.pkCol.join(".") });
-            }
-        };
-
-        // Called once the database is connected
-        idb.onsuccess = (event: any) => {
-            this._db[tableName] = event.target.result;
-            complete();
-        };
+          // Called once the database is connected
+          idb.onsuccess = (event: any) => {
+              this._db[tableName] = event.target.result;
+              complete();
+          };
+        })
     }
 
     dropTable(table: string, complete: () => void, error: (err: any) => void) {
@@ -82,10 +92,13 @@ export class IndexedDB extends nanoSQLMemoryIndex {
         objectStoreRequest.onsuccess = () => {
             this._db[table].close();
             delete this._db[table];
-            localStorage.removeItem(this._id + "_" + table + "_idb_version");
-            localStorage.removeItem(this._id + "_" + table + "_idb_hash");
-            localStorage.removeItem(this._id + "_" + table + "_idb_ai");
-            complete();
+            localForage.removeItem(this._id + "_" + table + "_idb_version").then(() => {
+              return localForage.removeItem(this._id + "_" + table + "_idb_hash");
+            }).then(() => {
+              return localForage.removeItem(this._id + "_" + table + "_idb_ai");
+            }).then(() => {
+              complete();
+            });
         };
     }
 
@@ -150,7 +163,7 @@ export class IndexedDB extends nanoSQLMemoryIndex {
                             if (writePk) {
                                 deepSet(this._tableConfigs[table].pkCol, row, pk);
                             }
-                    
+
                             this._ai[table] = Math.max(pk, this._ai[table]);
                             store.put(row);
                             results.push(pk);
@@ -192,22 +205,29 @@ export class IndexedDB extends nanoSQLMemoryIndex {
 
         this._ai[table] = Math.max(pk, this._ai[table]);
 
+        let promise
         if (this._tableConfigs[table].ai) {
             this._ai[table] = cast(this._id, "int", Math.max(this._ai[table] || 0, pk));
-            localStorage.setItem(this._id + "_" + table + "_idb_ai", String(this._ai[table]));
+            promise = localForage.setItem(this._id + "_" + table + "_idb_ai", String(this._ai[table]));
+        } else {
+            promise = Promise.resolve(true)
         }
 
-        deepSet(this._tableConfigs[table].pkCol, row, pk);
+        promise.then(() => {
 
-        this.store(table, "readwrite", (transaction, store) => {
-            try {
-                store.put(row).onsuccess = () => {
-                    complete(pk);
-                };
-            } catch (e) {
-                error(e);
-            }
-        }, error);
+            deepSet(this._tableConfigs[table].pkCol, row, pk);
+
+            this.store(table, "readwrite", (transaction, store) => {
+                try {
+                    store.put(row).onsuccess = () => {
+                        complete(pk);
+                    };
+                } catch (e) {
+                    error(e);
+                }
+            }, error);
+
+        })
     }
 
     read(table: string, pk: any, complete: (row: { [key: string]: any } | undefined) => void, error: (err: any) => void) {
@@ -241,7 +261,7 @@ export class IndexedDB extends nanoSQLMemoryIndex {
         const upperLimit = lowerLimit + limitOrHigh;
         let advancing: boolean = true;
         this.store(table, "readonly", (tr, store) => {
-            if ((store as any).getAll) { // IndexedDB 2 (way faster)  
+            if ((store as any).getAll) { // IndexedDB 2 (way faster)
                 const request = (store as any).getAll(type !== "range" ? undefined : IDBKeyRange.bound(offsetOrLow, limitOrHigh, false, false), type === "offset" && !reverse ? limitOrHigh + offsetOrLow : undefined);
                 request.onsuccess = (event: any) => {
                     const result: any[] = reverse ? event.target.result.reverse() : event.target.result;
@@ -261,7 +281,7 @@ export class IndexedDB extends nanoSQLMemoryIndex {
                         complete();
                         return;
                     }
-    
+
                     if (type === "offset") {
                         if (advancing) {
                             const lower = reverse ? lowerLimit + 1 : lowerLimit;
@@ -270,7 +290,7 @@ export class IndexedDB extends nanoSQLMemoryIndex {
                             advancing = false;
                             return;
                         }
-    
+
                         if (reverse ? upperLimit >= count : upperLimit > count) {
                             onRow(cursor.value, count - offsetOrLow);
                         }
@@ -323,4 +343,3 @@ export class IndexedDB extends nanoSQLMemoryIndex {
         }, error);
     }
 }
-
