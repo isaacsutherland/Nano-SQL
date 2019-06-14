@@ -37,7 +37,7 @@ export class IndexedDB extends nanoSQLMemoryIndex {
     createTable(tableName: string, tableData: InanoSQLTable, complete: () => void, error: (err: any) => void) {
 
         let version = 1;
-        let modelHash, idb;
+        let modelHash;
         this._tableConfigs[tableName] = tableData;
         const dataModelHash = hash(JSON.stringify(tableData.columns));
         let promise
@@ -59,9 +59,11 @@ export class IndexedDB extends nanoSQLMemoryIndex {
             })
         }
         promise.then(() => {
-          idb = indexedDB.open(this._id + "_" + tableName, version);
           return localForage.getItem(this._id + "_" + tableName + "_idb_ai")
         }).then(val => {
+
+          let idb = indexedDB.open(this._id + "_" + tableName, version);
+
           this._ai[tableName] = parseInt(val || "0");
 
           idb.onerror = error;
